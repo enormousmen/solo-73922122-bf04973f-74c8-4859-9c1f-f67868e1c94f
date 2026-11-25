@@ -1,0 +1,68 @@
+services:
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: log-debug-console:latest
+    container_name: log-debug-admin
+    command: ["uvicorn", "admin_service.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    environment:
+      ADMIN_DATA_DIR: /data/admin
+      WORKER_IDS: worker1,worker2
+      WORKER1_URL: http://worker1:8000
+      WORKER2_URL: http://worker2:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - admin-data:/data/admin
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+      start_period: 5s
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: log-debug-console:latest
+    container_name: log-debug-worker1
+    command: ["uvicorn", "worker_service.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    environment:
+      WORKER_ID: worker1
+      ADMIN_URL: http://admin:8000
+      WORKER_DATA_DIR: /data/worker1
+      POLL_INTERVAL: "1.0"
+    ports:
+      - "8001:8000"
+    volumes:
+      - worker1-data:/data/worker1
+    depends_on:
+      admin:
+        condition: service_started
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: log-debug-console:latest
+    container_name: log-debug-worker2
+    command: ["uvicorn", "worker_service.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    environment:
+      WORKER_ID: worker2
+      ADMIN_URL: http://admin:8000
+      WORKER_DATA_DIR: /data/worker2
+      POLL_INTERVAL: "1.0"
+    ports:
+      - "8002:8000"
+    volumes:
+      - worker2-data:/data/worker2
+    depends_on:
+      admin:
+        condition: service_started
+
+volumes:
+  admin-data:
+  worker1-data:
+  worker2-data:

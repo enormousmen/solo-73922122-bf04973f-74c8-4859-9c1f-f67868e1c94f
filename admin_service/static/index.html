@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>值班调试台 · 临时 DEBUG 与日志级别管理</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <h1>🛠️ 值班调试台</h1>
+      <p class="subtitle">两个独立 worker 进程 · 常规日志级别调整 · 限时 DEBUG / 续开 / 断连到期</p>
+    </div>
+    <div class="top-actions">
+      <div class="clock" id="serverClock">服务器时间 --:--:--</div>
+      <button class="btn btn-primary" id="writeAllBtn">📝 两边同时写样例日志</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="globalMsg" class="global-msg" hidden></div>
+    <section class="cards" id="cards">
+      <div class="loading">正在加载 worker 状态…</div>
+    </section>
+
+    <details class="semantics">
+      <summary>📖 行为约定 / API / 自测方法</summary>
+      <div class="semantics-grid">
+        <div>
+          <h3>级别与截止时间规则</h3>
+          <ul>
+            <li>每个进程有一个<b>常规级别</b>（默认 INFO），网页可随时修改并带版本号下发。</li>
+            <li>开启临时 DEBUG 时下发的是<b>绝对 UTC 截止时间</b>；续开会产生新的截止时间，worker 直接以新值为准。</li>
+            <li>DEBUG 期间收到的新常规级别先<b>挂起（pending）</b>，到期后才应用。</li>
+            <li>即使配置通道中断（暂停下发 / 管理服务重启或宕机），worker 也按<b>最后收到的截止时间</b>自行结束 DEBUG，恢复最后收到的常规级别（或调试期间挂起的新级别）。</li>
+            <li>重连后若截止时间已过，worker <b>跳过该 DEBUG 窗口</b>，不会重新进入 DEBUG。</li>
+            <li>管理端把配置（含原截止时间、暂停状态）持久化到数据卷，<b>重启后沿用原截止时间</b>。</li>
+          </ul>
+        </div>
+        <div>
+          <h3>主要 API</h3>
+          <pre>GET  /api/overview
+POST /api/workers/{id}/level                 {"level":"WARNING"}
+POST /api/workers/{id}/debug/start           {"seconds":30}
+POST /api/workers/{id}/debug/renew           {"seconds":120}
+POST /api/workers/{id}/debug/cancel
+POST /api/workers/{id}/pause | /resume
+POST /api/workers/{id}/sample-logs
+POST /api/sample-logs/write-all
+GET  /api/workers/{id}/logs?limit=200
+GET  /config/{id}                            (worker 轮询；暂停时 503)
+GET  http://localhost:8001/local/state       (直连 worker1)
+GET  http://localhost:8002/local/state       (直连 worker2)</pre>
+          <p class="hint">端到端场景脚本：<code>python scripts/e2e_check.py</code>（可用环境变量覆盖地址）。</p>
+        </div>
+      </div>
+    </details>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
