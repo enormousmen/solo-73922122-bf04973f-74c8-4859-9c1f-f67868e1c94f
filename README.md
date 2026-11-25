@@ -50,6 +50,18 @@ python3 scripts/e2e_check.py
 覆盖：常规级别过滤、DEBUG 期间级别挂起与到期应用、暂停下发后断连到期、重连跳过已过期窗口、
 续开跨过原截止时刻、一键两边写日志、暂停相互独立。
 
+进程重启日志续读 / 响应乱序的专项自检（自带临时 admin + 双 worker，跑在独立临时端口上，
+不影响常驻服务，仅用标准库）：
+
+```bash
+python3 scripts/restart_log_check.py
+```
+
+覆盖：worker 重启后凭 `boot_id` 自动切到新进程并补读缓冲（含“新编号已超过旧游标”）、
+迟到旧进程响应不改列表/游标、同进程并发乱序响应去重且游标不倒退、另一 worker 独立刷新。
+受限环境若禁止 `kill` 系统调用，脚本改用 `scripts/_restart_launcher.py`（标记文件触发
+uvicorn 优雅退出后 `execve` 同端口全新进程）模拟 `docker compose restart`，语义等价。
+
 ## 2. 推荐手工验收路径
 
 1. 打开 http://localhost:8000/ ，能看到两张 worker 卡片，实际级别均为 `INFO`，日志页每 5 秒有心跳。
@@ -115,6 +127,26 @@ worker 每 1 秒（compose 中 `POLL_INTERVAL=1.0`）GET `http://admin:8000/conf
 - 后台心跳每 5 秒写一条 DEBUG 明细、每 15 秒写一条 INFO 进展，开启 DEBUG 后日志面板会自动滚动。
 - 写样例接口返回每一级别是 `emitted` 还是 `suppressed`，可直接核对级别是否真的生效。
 
+### 3.4 进程重启后的日志续读（值班重启 worker 排障场景）
+
+环形缓冲是**进程内**状态：worker 进程一重启，缓冲清空、日志 `id` 从 1 重新计数，而调试页
+手里还拿着旧进程的续读游标（可能已经很大）。若只用 `after_id` 续读，新进程的日志会被
+`id > after_id` 全部过滤掉，面板从此漏掉新进程日志。修复方式：
+
+- 每个 worker 进程启动时生成唯一 **`boot_id`**（`/local/logs`、`/local/state`、`/healthz` 都带回，
+  另带 `booted_at` 启动时刻），并写一条 `[process-boot]` 日志进环形缓冲。
+- 调试页每个面板记录“当前跟随的 `boot_id`”。收到**陌生 `boot_id`** 即判定进程重启：
+  作废旧游标（`lastId=0`）、清空旧列表，按既有 `limit=200` 首读**补读新缓冲里仍可取到的日志**，
+  再以新进程自己的 `last_id` 继续增量轮询；即使新缓冲编号已经超过旧游标也能正确接上。
+- 已被换掉的**旧进程迟到响应**（`boot_id` 对不上、且是历史见过的 boot）一律判 `stale` 丢弃，
+  不改列表、不动游标、不改当前跟随进程。
+- 同一进程内每个日志请求带单调递增序号 `reqSeq`：自动轮询与“写样例后刷新”并发、乱序返回时，
+  只应用序号更新的响应；合并时再按日志 `id` 去重，且游标 `lastId` **只增不减**——
+  每条日志只显示一次，续读位置绝不倒退。请求不排队、不加全局锁，写样例后的刷新**不必等慢轮询**。
+- 两个 worker 的面板状态各自独立；一个重启/刷新，另一个照常轮询。
+- 沿用日志接口既有查询方式（首读 `limit=200`、增量 `after_id + limit=1000`）、面板排序
+  （最新在上）与显示条数（保留最近 400 条、渲染前 200 行），均未改变。
+
 ## 4. HTTP API 摘要
 
 管理端（http://localhost:8000）：
@@ -138,11 +170,13 @@ GET  /config/{id}                       worker 轮询用；paused 时 503
 worker 本地（compose 网络内 `:8000`，宿主机 `8001/8002`）：
 
 ```text
-GET  /healthz
-GET  /local/state
-GET  /local/logs?limit=200&after_id=0&level=DEBUG,INFO
+GET  /healthz                                  含 worker_id、boot_id
+GET  /local/state                              状态快照 + boot_id、booted_at
+GET  /local/logs?limit=200&after_id=0&level=DEBUG,INFO   响应含 boot_id、booted_at
 POST /local/write-sample
 ```
+
+> `boot_id` 是每次进程启动新生成的身份标识；调试页用它识别 worker 重启并续读新缓冲。
 
 ## 5. 已实现功能（对照需求）
 
@@ -160,6 +194,10 @@ POST /local/write-sample
       最近成功轮询、连续失败、错误信息与彩色日志流（自动刷新、级别过滤、清空显示）。
 - [x] Dockerfile + docker-compose.yml（admin/worker1/worker2 + 3 个命名卷 + 健康检查）。
 - [x] 零第三方依赖的端到端自检脚本 `scripts/e2e_check.py`。
+- [x] **worker 进程重启后的日志续读**：每进程 `boot_id` 身份，调试页检测到陌生 boot 自动切到
+      新进程、作废旧游标并补读新缓冲（即使新编号已超过旧游标）；旧进程迟到响应判 stale 丢弃，
+      不改列表/游标；同进程并发乱序响应按 id 去重、游标只增不减；写样例刷新不等慢轮询；
+      另一 worker 独立刷新。专项自检 `scripts/restart_log_check.py`（22 项）。
 
 ## 6. 实测结果（2026-11-25，UTC）
 
@@ -217,12 +255,37 @@ uvicorn 进程**（等价于容器重启后新进程读命名卷），`/api/over
 - “暂停期间把级别改成 ERROR，2.2 秒内 worker 仍为 INFO；恢复后秒级变 ERROR”：PASS。
 - `GET /`、`/static/styles.css`、`/static/app.js`、`/healthz` 均为 200 且 Content-Type 正确。
 
+### 6.6 进程重启续读与响应乱序（本次新增，全部 PASS）
+
+测试在 Python 3.11 venv 中对**真实 uvicorn 进程**进行（非 mock 业务逻辑），分三层：
+
+1. **专项自检 `scripts/restart_log_check.py`：22 passed, 0 failed**（仅标准库）。
+   脚本在临时目录、独立端口起真实 admin + 双 worker；用 `scripts/_restart_launcher.py` 触发
+   worker1 旧 uvicorn 优雅退出并 `execve` 同端口全新进程（等价 `docker compose restart`，
+   新 `boot_id`、空环形缓冲），并令新缓冲通过 `WORKER_LOG_START_ID=500` 从更大编号开始，
+   实测：旧游标 `lastId=10` 时重启，`after_id=600` 对新缓冲返回空但带新 `boot_id`（修复前的
+   漏日志卡死点）；页面状态机凭陌生 `boot_id` 判 `switched`，补读到新缓冲 `id=500…` 的
+   `[process-boot]` 行，游标更新为新进程 `last_id`；伪造的旧 boot 迟到响应判 `stale`，
+   游标与列表不变；同进程两个并发请求乱序应用后无重复 id、游标不倒退；worker2 boot 未变、
+   独立刷新。
+2. **前端 jsdom 竞态套件（内存假后端，加载真实 `index.html` + `app.js`）：33 passed, 0 failed**。
+   覆盖：重启后自动切换 + 补读（含新编号 90/200/500 超过旧游标的多组取值）、旧进程在途请求
+   重启后才返回时不改列表/游标、慢轮询挂起时写样例刷新立即上屏（不等慢轮询）、乱序返回去重且
+   游标不倒退、二次重启与历史 boot 迟到判 stale、两 worker 面板互不影响。
+3. **真实后端 jsdom 冒烟（fetch 指向真实运行的 8500/8501/8502）：11 passed, 0 failed**。
+   真实页面渲染两张卡片、面板显示真实 boot 短号与 100+ 行日志、点“写样例日志”新行真实进入面板、
+   连续两个自动轮询周期无重复行、全程无未处理 JS 错误 / Promise 异常。
+
+回归确认：改动后原 `scripts/e2e_check.py` 仍为 **33 passed, 0 failed**；全部 Python 文件
+`py_compile` 通过；`app.js` 通过 `node --check`；compose/Dockerfile 静态不变量校验通过。
+
 ## 7. 未完成项 / 已知限制
 
 1. **未在本环境真正执行 `docker compose up --build`**（无 Docker）。Docker 镜像构建、
    compose 网络内 DNS（`http://admin:8000`、`http://worker1:8000`）未在本机实跑；
    已用相同入口/环境的本地多进程 + compose 静态校验最大程度替代，首次在有 Docker 的机器上
-   建议先跑一次 `docker compose up --build` 与 `scripts/e2e_check.py`。
+   建议先跑一次 `docker compose up --build`、`scripts/e2e_check.py` 与
+   `scripts/restart_log_check.py`，并在调试页按下面的“手工验收重启续读”走一遍。
 2. **未做真实浏览器视觉/点击验证与截图**；前端经 jsdom 对接真实后端验证，未做像素级 UI 走查。
 3. 调试页/API **没有鉴权、登录与 HTTPS**，定位是内网值班临时工具；端口 8000/8001/8002
    直接暴露在宿主网卡上，如需跨网段使用请放到反向代理/VPN 后并加鉴权。
@@ -232,3 +295,18 @@ uvicorn 进程**（等价于容器重启后新进程读命名卷），`/api/over
    日志驱动收集，未接 ELK/Loki 等中心日志。
 6. 目前只内置两个固定 worker（`WORKER_IDS` / compose 服务）；新增进程需要同时加服务定义与
    `WORKER{n}_URL` 环境变量，尚未做动态注册。
+7. 本环境 seccomp 禁止 `kill` 系统调用，无法字面演示 `docker compose restart worker1`；
+   重启改用 `_restart_launcher.py` 的“uvicorn 优雅退出 + `execve` 同端口新进程”等价模拟，
+   真实 Docker 环境里直接 `docker compose restart worker1` 即可触发同样的 boot 切换路径。
+   `WORKER_LOG_START_ID` 仅为测试钩子（默认不设，缓冲仍从 id=1 开始），compose 不使用它。
+
+### 调试页手工验收重启续读（有 Docker 的环境）
+
+```bash
+docker compose up --build -d
+# 打开 http://localhost:8000/ ，等 worker1 面板出现若干日志、meta 显示 boot 短号
+docker compose restart worker1
+# 页面 1~2 秒内：顶部提示“检测到进程重启…已切到新进程并补读缓冲日志”，
+# 面板 meta 出现“进程已切换 旧boot→新boot（缓冲重新计数）”，新 [process-boot] 行在列，
+# 之后心跳/写样例日志继续滚动；worker2 面板不受影响。
+```

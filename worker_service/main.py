@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,12 @@ ops_logger = logging.getLogger("worker_service")
 
 ring = sample_module.configure()
 state = WorkerState(WORKER_ID, DATA_DIR)
+
+# ---------------------------------------------------------------- 进程身份
+# 每次进程启动生成全新 boot_id；环形缓冲是进程内状态，重启后日志 id 从 1 重新计数，
+# 调试页据此识别“换进程”并把续读游标重置到新缓冲，避免 after_id 越过新缓冲而漏日志。
+BOOT_ID = os.getenv("WORKER_BOOT_ID") or uuid.uuid4().hex
+BOOTED_AT = to_iso(utcnow())
 
 
 async def poll_config_loop(app: FastAPI) -> None:
@@ -109,13 +116,20 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(heartbeat_loop(), name="heartbeat"),
     ]
     ops_logger.info(
-        "worker %s started: admin=%s poll=%.1fs data=%s actual_level=%s deadline=%s",
+        "worker %s started: admin=%s poll=%.1fs data=%s actual_level=%s deadline=%s boot=%s",
         WORKER_ID,
         ADMIN_URL,
         POLL_INTERVAL,
         DATA_DIR,
         sample_module.actual_level_name(),
         to_iso(state.debug_deadline),
+        BOOT_ID,
+    )
+    # 写进样例日志环形缓冲，调试页面板上能直接看到“新进程已启动、缓冲重新计数”
+    sample_module.logger.info(
+        "[process-boot] worker %s 新进程已启动 boot_id=%s，日志环形缓冲重新计数",
+        WORKER_ID,
+        BOOT_ID,
     )
     try:
         yield
@@ -131,12 +145,16 @@ app = FastAPI(title=f"worker {WORKER_ID}", lifespan=lifespan)
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "worker_id": WORKER_ID}
+    return {"status": "ok", "worker_id": WORKER_ID, "boot_id": BOOT_ID}
 
 
 @app.get("/local/state")
 async def get_state():
-    return state.snapshot()
+    snap = state.snapshot()
+    # 进程身份：调试页用它识别进程重启（状态接口和日志接口各带一份，任一先到都能发现）
+    snap["boot_id"] = BOOT_ID
+    snap["booted_at"] = BOOTED_AT
+    return snap
 
 
 @app.get("/local/logs")
@@ -148,6 +166,8 @@ async def get_logs(
     levels = [lv.strip() for lv in level.split(",")] if level else None
     return {
         "worker_id": WORKER_ID,
+        "boot_id": BOOT_ID,
+        "booted_at": BOOTED_AT,
         **ring.query(limit=limit, after_id=after_id, levels=levels),
     }
 

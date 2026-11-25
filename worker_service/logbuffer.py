@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import deque
 from datetime import datetime, timezone
@@ -11,10 +12,11 @@ from common.timeutil import to_iso, utcnow
 
 
 class RingBufferHandler(logging.Handler):
-    def __init__(self, capacity: int = 1000):
+    def __init__(self, capacity: int = 1000, start_id: int = 1):
         super().__init__()
         self._records: deque[Dict[str, Any]] = deque(maxlen=capacity)
-        self._next_id = 1
+        # 正常进程从 1 开始；测试可通过 WORKER_LOG_START_ID 模拟“新进程编号更大”
+        self._next_id = max(1, int(start_id))
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:

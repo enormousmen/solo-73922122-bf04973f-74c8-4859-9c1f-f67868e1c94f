@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import random
 import time
 from typing import Any, Dict, List
@@ -35,7 +36,10 @@ def configure(ring_capacity: int = 1000) -> RingBufferHandler:
     logger.propagate = False
 
     if _ring is None:
-        _ring = RingBufferHandler(capacity=ring_capacity)
+        # 测试钩子：WORKER_LOG_START_ID 让新进程缓冲从更大编号开始，
+        # 模拟“重启后新编号已经超过页面旧游标”；生产不设置该变量，行为仍是从 1 开始。
+        start_id = int(os.getenv("WORKER_LOG_START_ID", "1"))
+        _ring = RingBufferHandler(capacity=ring_capacity, start_id=start_id)
         _ring.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s")
         )

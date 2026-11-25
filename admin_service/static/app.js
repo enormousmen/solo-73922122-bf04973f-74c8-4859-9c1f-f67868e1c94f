@@ -159,7 +159,19 @@ function ensureCard(wid) {
   const card = wrap.firstElementChild;
   $cards.appendChild(card);
 
-  state.logs[wid] = { items: [], lastId: 0, auto: true, filter: "ALL", error: null, initialized: false };
+  state.logs[wid] = {
+    items: [],
+    lastId: 0,
+    auto: true,
+    filter: "ALL",
+    error: null,
+    initialized: false,
+    bootId: null, // 当前面板所跟随进程的 boot_id（重启后换新值）
+    knownBoots: [], // 本页面已见过的 boot_id，用于识别迟到的旧进程响应
+    reqSeq: 0, // 已发出的日志请求序号（单调递增，不排队、不互斥）
+    appliedReq: 0, // 已应用的最大请求序号（同进程内乱序响应只认最新的）
+    restartNotice: null // 最近一次切换到新进程的提示
+  };
 
   card.addEventListener("click", (ev) => onCardClick(ev, wid));
   card.querySelector(`#logFilter-${wid}`).addEventListener("change", (ev) => {
@@ -292,6 +304,12 @@ function updateCard(w) {
   card.classList.toggle("is-paused", !!cfg.paused);
   card.classList.toggle("is-down", !live);
 
+  // 状态接口同样带 boot_id：每秒一次的概览比 2 秒一次的日志轮询更早发现进程重启。
+  // 检测到重启时 handleBootChange 会重置游标并立即发起新进程缓冲补读。
+  if (live && live.boot_id) {
+    handleBootChange(wid, { boot_id: live.boot_id, booted_at: live.booted_at });
+  }
+
   // 头部通道状态
   const dot = document.getElementById(`dot-${wid}`);
   const channel = document.getElementById(`channel-${wid}`);
@@ -383,28 +401,127 @@ function updateCard(w) {
 }
 
 // ------------------------------------------------------------ 日志
+// 进程重启续读的整体思路：
+//   1) 每个 worker 进程启动时生成唯一 boot_id，日志/状态接口都带回来；
+//   2) 面板状态里的 bootId 记录“当前正在跟随的进程”。收到陌生 boot_id 即判定进程重启：
+//      新进程缓冲的日志 id 从 1 重新计数，旧游标（可能已经很大）必须作废，
+//      直接用 limit=200 补读新缓冲里仍可取到的日志，再以新进程自己的 last_id 续读；
+//   3) 已经被换掉的旧进程迟到响应（boot_id 对不上）一律丢弃，不动列表也不动游标；
+//   4) 同一进程内每个请求带单调 reqSeq，乱序返回时只应用序号更大的响应；
+//      合并再按 id 去重 + 游标只增不减，双保险保证每条日志只显示一次、续读位置不倒退。
+function shortBoot(bootId) {
+  return bootId ? String(bootId).slice(0, 8) : "--";
+}
+
+/**
+ * 识别并处理进程切换。
+ * 返回 "adopted"（首次见到该进程，本次响应继续应用）、
+ *      "switched"（检测到重启，已重置并发起补读，本次响应应丢弃）、
+ *      "stale"（旧进程的迟到响应，必须丢弃）、
+ *      "unknown"（响应不含 boot_id，例如 worker 不可达时的代理错误，调用方按错误处理）。
+ */
+function handleBootChange(wid, data) {
+  const ls = state.logs[wid];
+  const bootId = data && data.boot_id ? String(data.boot_id) : null;
+  if (!bootId) return "unknown";
+  if (ls.bootId === bootId) return "same";
+  if (!ls.bootId) {
+    ls.bootId = bootId;
+    if (!ls.knownBoots.includes(bootId)) ls.knownBoots.push(bootId);
+    return "adopted";
+  }
+  if (ls.knownBoots.includes(bootId)) {
+    // 已被换掉的旧进程迟到响应：不能改动列表或游标
+    return "stale";
+  }
+  // 陌生 boot_id → worker 已重启，自动切到新进程
+  const oldBoot = shortBoot(ls.bootId);
+  ls.knownBoots.push(bootId);
+  ls.bootId = bootId;
+  ls.items = [];
+  ls.lastId = 0;
+  ls.initialized = false;
+  ls.error = null;
+  ls.appliedReq = 0; // 旧进程所有在途请求全部作废
+  ls.restartNotice = {
+    at: new Date().toISOString(),
+    from: oldBoot,
+    to: shortBoot(bootId),
+    bootedAt: data.booted_at || null
+  };
+  renderLogs(wid);
+  showGlobal(`${wid} 检测到进程重启（${oldBoot} → ${shortBoot(bootId)}），已切到新进程并补读缓冲日志`);
+  // 用新进程自己的缓冲重新首读（limit 沿用既有 200 条查询方式），不 await，不阻塞调用方
+  loadLogs(wid, true);
+  return "switched";
+}
+
+/** 应用一条同进程日志响应：按 id 去重合并，游标只增不减。 */
+function applyLogResponse(wid, data, reqId) {
+  const ls = state.logs[wid];
+  if (reqId <= ls.appliedReq) return; // 乱序的旧响应，丢弃
+  ls.appliedReq = reqId;
+  ls.error = data.error || null;
+  const incoming = Array.isArray(data.logs) ? data.logs : [];
+  if (incoming.length) {
+    const seen = new Set(ls.items.map((r) => r.id));
+    for (const r of incoming) {
+      if (!seen.has(r.id)) {
+        ls.items.push(r);
+        seen.add(r.id);
+      }
+    }
+    // 同进程内按 id 排序，配合 reverse() 保持“最新在上”的面板排序
+    ls.items.sort((a, b) => a.id - b.id);
+    if (ls.items.length > 400) ls.items = ls.items.slice(-400); // 显示条数上限维持 400
+  }
+  // 续读游标只允许前进，乱序/迟到响应都不能让它倒退
+  const newLast = Number(data.last_id) || 0;
+  if (newLast > ls.lastId) ls.lastId = newLast;
+  renderLogs(wid);
+}
+
 async function loadLogs(wid, force = false) {
   const ls = state.logs[wid];
   if (!ls) return;
   if (!force && ls.auto === false) return;
+
+  // 每个请求独立序号，不排队、不加全局锁：写样例后的刷新无需等待慢轮询
+  const reqId = ++ls.reqSeq;
+  const firstRead = !ls.initialized;
+  // 沿用日志接口现有查询方式：首读 limit=200；增量用 after_id 游标 + limit=1000
+  const url = firstRead
+    ? `/api/workers/${wid}/logs?limit=200`
+    : `/api/workers/${wid}/logs?after_id=${ls.lastId}&limit=1000`;
+
+  let data;
   try {
-    let data;
-    if (!ls.initialized) {
-      data = await api(`/api/workers/${wid}/logs?limit=200`);
-      ls.items = data.logs || [];
-      ls.initialized = true;
-    } else {
-      data = await api(`/api/workers/${wid}/logs?after_id=${ls.lastId}&limit=1000`);
-      if (data.logs && data.logs.length) ls.items = ls.items.concat(data.logs);
-      if (ls.items.length > 400) ls.items = ls.items.slice(-400);
-    }
-    ls.lastId = data.last_id || ls.lastId;
-    ls.error = data.error || null;
-    renderLogs(wid);
+    data = await api(url);
   } catch (err) {
-    ls.error = err.message;
-    renderLogs(wid);
+    // 仅当没有更新的请求已处理过时展示错误；不清空列表、不动游标
+    if (reqId > ls.appliedReq) {
+      ls.appliedReq = reqId;
+      ls.error = err.message;
+      renderLogs(wid);
+    }
+    return;
   }
+
+  const bootAction = handleBootChange(wid, data);
+  if (bootAction === "stale" || bootAction === "switched") return;
+  if (bootAction === "unknown" && data.error) {
+    // worker 不可达时管理端代理返回的错误信封（无 boot_id）
+    if (reqId > ls.appliedReq) {
+      ls.appliedReq = reqId;
+      ls.error = data.error;
+      renderLogs(wid);
+    }
+    return;
+  }
+
+  // 首读与增量都走去重合并（应对首读与增量请求并发的边界），游标始终只增不减
+  ls.initialized = true;
+  applyLogResponse(wid, data, reqId);
 }
 
 function renderLogs(wid) {
@@ -413,7 +530,12 @@ function renderLogs(wid) {
   const meta = document.getElementById(`logMeta-${wid}`);
   if (!listEl || !ls) return;
 
-  meta.textContent = ls.error ? "日志接口错误：" + ls.error : `缓冲显示 ${ls.items.length} 条`;
+  const notice = ls.restartNotice
+    ? `进程已切换 ${ls.restartNotice.from}→${ls.restartNotice.to}（缓冲重新计数） · `
+    : "";
+  meta.textContent = ls.error
+    ? "日志接口错误：" + ls.error
+    : `${notice}进程 ${shortBoot(ls.bootId)} · 缓冲显示 ${ls.items.length} 条`;
 
   let items = ls.items.slice().reverse();
   if (ls.filter !== "ALL") items = items.filter((r) => r.level === ls.filter);
